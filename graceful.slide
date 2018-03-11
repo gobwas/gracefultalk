@@ -1,0 +1,296 @@
+Graceful Restarts with Go
+17 March 2017
+Tags: graceful, restart
+
+Сергей Камардин
+MailRu Group
+gobwas@gmail.com
+https://github.com/gobwas
+@gobwas
+
+* Что такое graceful restart?
+
+Graceful restart (англ. изящный) – это механизм перезагрузки кода работающей программы без прерывания ее взаимодействия с внешним миром.
+
+* Graceful Restart & Web
+
+Взаимодействие с внешним миром подразумевает под собой обработку задач поступающих от клиента сервиса.
+
+Во время перезагрузки запускаются новые обработчики задач, после чего старые штатно завершают свою работу.
+
+Завершение работы старых обработчиков не должно приводить к ошибкам или потерям данных клиента.
+
+* Graceful Restart & Web
+
+.code media/diagram/graceful-00.txt
+
+* Graceful Restart & Web
+
+.code media/diagram/graceful-01.txt
+
+* Graceful Restart & Web
+
+.code media/diagram/graceful-02.txt
+
+* Graceful Restart & Web
+
+Речь будет идти только о сетевом взаимодействии программ, поэтому API приложений в нашем случае будут сетевыми.
+
+Это активные (net.Conn) и пассивные (net.Listener) сокеты.
+
+У каждого сокета в POSIX-совместимых ОС есть свой идентификатор, который мы будем называть дескриптором.
+
+* Способы реализации
+
+Graceful Restart можно реализовать разными способами или их комбинацией.
+
+Общее требование для всех вариантов – поддержка протоколом штатного завершения соединения. 
+
+* Способ реализации: Умный клиент
+
+Самый простой и достаточно надежный способ.
+
+Программа просто плавно завершает свою работу (graceful shutdown).
+После этого запускается новая версия программы.
+
+Клиент должен уметь обрабатывать временную недоступность сервера при установке соединения.
+
+* Способ реализации: Умный клиент
+
+Примеры:
+
+- Клиент в виде nginx который знает о нескольких серверах (можно выводить из нагрузки сервер перед рестартом, или помечать временно недоступным при первом connection refused; (Работает только с количеством нод >1);
+- Клиент в виде простого reconnect-цикла;
+
+* Способ реализации: Умный клиент
+
+HTTP-сервер:
+
+	var (
+		srv  = http.Server{}
+	    exit = make(chan struct{})
+	    term = make(chan os.Signal, 1)
+	)
+
+	signal.Notify(term, syscall.SIGTERM)
+
+	go func() {
+	    <-term
+		srv.Shutdown(ctx)
+		close(exit)
+	}()
+
+	err := srv.ListenAndServe()
+	if err == http.ErrServerClosed {
+		<-exit
+	}
+
+* Способ реализации: Умный клиент
+
+HTTP-клиент:
+
+	var (
+		client  http.Client
+		req    *http.Request
+	)
+	for i := RetryLimit; i >= 0; i-- {
+		resp, err = client.Do(req)
+		if isConnectionRefused(err) {
+			time.Sleep(RetryDelay)
+			continue
+		}
+		break
+	}
+
+	// Handle response and error.
+
+* Способ реализации: Передача дескрипторов
+
+При необходимости в перезагрузке запускается новый процесс, который умеет взаимодействовать со старым. 
+
+Cтарый процесс передает новому дескрипторы сетевых сокетов и, если нужно, их состояние. 
+
+После успешной передачи дескрипторов старому процессу посылается сигнал о необходимости штатного завершения своей работы.
+
+Для Linux >= 3.9 есть возможность привязать несколько AF_INET/AF_INET6 слушающих сокетов к одному порту с помощью опции SO_REUSEPORT. Таким образом, можно вообще не передавать дескрипторы.
+
+* Способ реализации: Передача дескрипторов
+
+Сервер:
+
+	var (
+		tcpLn  *net.TCPListener
+		unixLn *net.UnixListener
+	)
+
+	file, _ := tcpLn.File()
+
+	for {
+	    worker, err := unixLn.Accept()
+	    if err != nil {
+	        // handle error
+	    }
+	    worker.WriteMsgUnix(
+	    	[]byte("my cool listener"),
+			syscall.UnixRights(int(file.Fd()),
+	    	nil, 
+	    )
+	}
+
+* Способ реализации: Передача дескрипторов
+
+Клиент:
+
+	predcessor, _ := net.Dial("unix", "...")
+	if err != nil {
+		// We are first instance.
+		// Listen tcp and serve as usual.
+	}
+
+	var (
+		msg = make([]byte, 1024)
+		oob = make([]byte, 1024)
+	)
+	msgn, oobn, _ := predcessor.ReadMsgUnix(msg, oob)
+	cmsg, _ := syscall.ParseSocketControlMessage(oob[:oobn])
+	fds, _ := syscall.ParseUnixRights(&cmsg[0])
+
+	file := os.NewFile(fds[0], string(msg[:msgn]))
+	
+	ln, _ := net.FileListener(file)
+
+	// Serve net.Listener
+
+
+* Способ реализации: Master-процесс
+
+Экземпляры программы запускаются мастер-процессом (он же wrapper), который владеет интерфейсом взаимодействия с внешним миром. 
+
+Master-процесс может осуществлять взаимодействие сам или передавать дескриптор API каждому запущенному экземпляру программы.
+
+При необходимости перезагрузки запускается дополнительный экземпляр программы.
+
+Старым экземплярам посылается сигнал о необходимости штатно завершить свою работу.
+
+* Способ реализации: Master-процесс
+
+Master-процесс может быть реализован в общем виде.
+
+Существуют следующие реализации:
+
+- systemd
+- supervisord
+- bash scripts
+- ...
+
+* Способ реализации: Master-процесс
+
+В простейшем виде может выглядеть так:
+
+	ln, err := net.Listen("tcp", "0.0.0.0:80")
+	if err != nil {
+	    // handle error
+	}
+	file, err := ln.(*net.TCPListener).File()
+	if err != nil {
+	    // handle error
+	}
+	cmd := exec.Command("worker")
+	cmd.ExtraFiles = []*os.File{file}
+	cmd.Run()
+
+* Способ реализации: Master-процесс
+
+Экземпляр программы:
+
+	file := os.NewFile(3, "listener")
+	ln, err := net.FileListener(file)
+	if err != nil {
+	    // handle error
+	}
+	s := http.Server{ ... }
+	if err := s.Serve(ln); err != nil && err != ErrServerClosed {
+	    // handle error
+	}
+
+* Итого
+
+- Умный клиент
+- Передача дескрипторов
+- Master process
+
+* Поддержка Graceful Restart сетевыми протоколами
+
+Чуть выше мы говорили о штатном завершении соединений.
+
+В общем виде – это отправка одной стороной сигнала о том, что она больше не будет отправлять данные.
+
+При этом вторая сторона переходит в состояние закрытия – досылает все данные из очереди на отправку, посылает аналогичный сигнал о прекращении отправки данных и закрывает соединение.
+
+* TCP
+
+Самый нижний уровень, на котором вводится понятие соединения – TCP.
+
+Из RFC793:
+
+The user who CLOSEs may continue to RECEIVE until he is told that the other
+side has CLOSED also. Thus, a program could initiate several SENDs followed by
+a CLOSE, and then continue to RECEIVE until signaled that a RECEIVE failed
+because the other side has CLOSED.
+
+Closing connections is intended to be a graceful operation in the sense that
+outstanding SENDs will be transmitted (and retransmitted), as flow control
+permits, until all have been serviced.
+
+* Graceful Restart и TCP
+
+ TCP A                                                TCP B
+
+  1.  ESTABLISHED                                          ESTABLISHED
+
+  2.  (Close)
+      FIN-WAIT-1  --> <SEQ=100><ACK=300><CTL=FIN,ACK>  --> CLOSE-WAIT
+
+  3.  FIN-WAIT-2  <-- <SEQ=300><ACK=101><CTL=ACK>      <-- CLOSE-WAIT
+
+  4.                                                       (Close)
+      TIME-WAIT   <-- <SEQ=300><ACK=101><CTL=FIN,ACK>  <-- LAST-ACK
+
+  5.  TIME-WAIT   --> <SEQ=101><ACK=301><CTL=ACK>      --> CLOSED
+
+  6.  (2 MSL)
+      CLOSED
+
+                         Normal Close Sequence
+
+* Graceful Restart и HTTP/1.1
+
+В случае с HTTP сервер использует два средства сигнализации:
+
+- FIN-пакеты TCP 
+- Заголовок "Connection: close" 
+
+При получении сигнала от сервера (EOF), клинет досылает все данные (или прерывает отправку) и перестает ожидать ответа на отправленные запросы, помечая, что их можно переотправить.
+
+После этого посылает ответный EOF и, закрыв соединение, переустанавливает его c последующим retry запросов.
+
+
+* Graceful Restart и бинарный протокол X
+
+ PROTO A                   PROTO B
+
+    1.  ESTABLISHED               ESTABLISHED
+  
+    2.  (Close)
+        FIN-WAIT  -->  <FIN>  --> CLOSING
+  
+    3.                            (Close)
+        CLOSED    <--  <FIN>  <-- CLOSED
+  
+
+
+* Graceful Restart и WebSocket
+
+Close frame handshake
+
+* The end
